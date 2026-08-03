@@ -2,8 +2,9 @@ name: Daily Stock Report
 
 on:
   schedule:
-    # 毎日 22:00 UTC = 日本時間 7:00 に自動実行
-    - cron: '0 22 * * *'
+    # 毎時00分に自動更新(UTC)
+    #日本時間では毎時+9時間
+    - cron: '0 0~14 * * 1-5'
   workflow_dispatch:
     # GitHubの画面から手動実行もできるようにする
 
