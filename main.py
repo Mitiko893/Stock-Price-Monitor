@@ -102,6 +102,9 @@ def get_financial_data(ticker: str) -> dict:
         stock = yf.Ticker(ticker)
         info = stock.info
 
+        currency = info.get("currency", "JPY")
+        sector = info.get("sector")
+        industry = info.get("industry")
         per = info.get("trailingPE")
         pbr = info.get("priceToBook")
         market_cap = info.get("marketCap")
@@ -128,6 +131,9 @@ def get_financial_data(ticker: str) -> dict:
 
         return {
             "ticker": ticker,
+            "currency": currency,
+            "sector": sector,
+            "industry": industry,
             "per": per,
             "pbr": pbr,
             "market_cap": market_cap,
@@ -135,6 +141,35 @@ def get_financial_data(ticker: str) -> dict:
         }
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
+
+
+def get_dividend_data(ticker: str, years: int = 10) -> dict:
+    """
+    配当利回り・配当性向(現在の指標)と、直近N年分の年間配当推移(増配・減配の履歴)を取得する。
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        currency = info.get("currency", "JPY")
+        dividend_yield = info.get("dividendYield")
+        payout_ratio = info.get("payoutRatio")
+
+        yearly_dividends = []
+        dividends = stock.dividends
+        if dividends is not None and not dividends.empty:
+            by_year = dividends.groupby(dividends.index.year).sum()
+            for year, amount in by_year.tail(years).items():
+                yearly_dividends.append({"year": int(year), "amount": round(float(amount), 1)})
+
+        return {
+            "currency": currency,
+            "dividend_yield": dividend_yield,
+            "payout_ratio": payout_ratio,
+            "yearly_dividends": yearly_dividends,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def get_scoring_metrics(ticker: str) -> dict:
@@ -364,11 +399,70 @@ def compute_score(metrics: dict, sentiment: str) -> dict:
     return {"breakdown": breakdown, "total": total}
 
 
-def format_oku(value) -> str:
-    """円単位の数値を「億円」表示の文字列に変換する。データがなければ '-' を返す"""
+def compute_sector_peers(companies: list) -> dict:
+    """
+    watchlist内で同じセクター(業種)の銘柄同士をグループ化し、平均値を計算する。
+    ※ 本当の「業界全体の平均」ではなく、あくまでこのwatchlistに入っている
+      同業種銘柄同士の平均であることに注意(無料データの制約のため)。
+    """
+    groups: dict = {}
+    for c in companies:
+        sector = c["financial_data"].get("sector")
+        if not sector:
+            continue
+        groups.setdefault(sector, []).append(c)
+
+    def avg(values):
+        values = [v for v in values if v is not None]
+        return sum(values) / len(values) if values else None
+
+    sector_stats = {}
+    for sector, members in groups.items():
+        sector_stats[sector] = {
+            "count": len(members),
+            "per": avg([m["financial_data"].get("per") for m in members]),
+            "pbr": avg([m["financial_data"].get("pbr") for m in members]),
+            "roe": avg([m["scoring_metrics"].get("roe") for m in members]),
+            "operating_margin": avg([m["scoring_metrics"].get("operating_margin") for m in members]),
+        }
+    return sector_stats
+
+
+def format_large_amount(value, currency: str = "JPY") -> str:
+    """
+    大きな金額を通貨に応じた単位で読みやすく表示する。
+    日本円は「億円」単位、米ドルは「B(10億ドル)」単位、それ以外は通貨コード付きの生の数値。
+    データがなければ '-' を返す。
+    """
     if value is None:
         return "-"
-    return f"{value / 1e8:,.0f}億円"
+    if currency == "JPY":
+        return f"{value / 1e8:,.0f}億円"
+    if currency == "USD":
+        return f"${value / 1e9:,.1f}B"
+    return f"{value:,.0f} {currency}"
+
+
+def format_price(value, currency: str = "JPY") -> str:
+    """株価などの単価を通貨に応じて表示する。データがなければ '-' を返す"""
+    if value is None:
+        return "-"
+    if currency == "JPY":
+        return f"{value:,.1f}円"
+    if currency == "USD":
+        return f"${value:,.2f}"
+    return f"{value:,.2f} {currency}"
+
+
+def format_per_share(value, currency: str = "JPY") -> str:
+    """1株あたりの配当などを通貨に応じて表示する。データがなければ '-' を返す"""
+    if value is None:
+        return "-"
+    if currency == "JPY":
+        return f"{value:,.1f}円/株"
+    if currency == "USD":
+        return f"${value:,.2f}/株"
+    return f"{value:,.2f} {currency}/株"
 
 
 def format_ratio(value) -> str:
@@ -400,21 +494,23 @@ def get_news(company_name: str, max_items: int = 3) -> list:
 def build_analysis_prompt(name: str, stock_data: dict, financial_data: dict, news_items: list) -> str:
     """AIに渡すプロンプトを組み立てる(1行目:ニュースの論調、2行目以降:要約)"""
     lines = [f"以下は「{name}」という会社の株価・財務データ・ニュース見出しです。"]
+    currency = financial_data.get("currency", "JPY")
 
     if "error" not in stock_data:
         sign = "+" if stock_data["change"] >= 0 else ""
-        lines.append(f"株価: {stock_data['price']:,}円 (前日比 {sign}{stock_data['change_pct']}%)")
+        lines.append(f"株価: {format_price(stock_data['price'], currency)} (前日比 {sign}{stock_data['change_pct']}%)")
 
     if "error" not in financial_data:
         lines.append(
             f"PER: {format_ratio(financial_data.get('per'))} / "
             f"PBR: {format_ratio(financial_data.get('pbr'))} / "
-            f"時価総額: {format_oku(financial_data.get('market_cap'))}"
+            f"時価総額: {format_large_amount(financial_data.get('market_cap'), currency)}"
         )
         earnings_trend = financial_data.get("earnings_trend", [])
         if earnings_trend:
             trend_text = " / ".join(
-                f"{e['period']}期 売上{format_oku(e['revenue'])}・純利益{format_oku(e['net_income'])}"
+                f"{e['period']}期 売上{format_large_amount(e['revenue'], currency)}"
+                f"・純利益{format_large_amount(e['net_income'], currency)}"
                 for e in earnings_trend
             )
             lines.append(f"決算推移: {trend_text}")
@@ -493,6 +589,7 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
 
         stock_data = get_stock_data(ticker)
         financial_data = get_financial_data(ticker)
+        dividend_data = get_dividend_data(ticker)
         news_items = get_news(name)
         scoring_metrics = get_scoring_metrics(ticker)
 
@@ -508,8 +605,10 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
             "ticker": ticker,
             "stock_data": stock_data,
             "financial_data": financial_data,
+            "dividend_data": dividend_data,
             "news_items": news_items,
             "ai_analysis": ai_analysis,
+            "scoring_metrics": scoring_metrics,
             "score": score,
         })
 
@@ -518,19 +617,21 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
     for c in companies:
         stock_data = c["stock_data"]
         financial_data = c["financial_data"]
+        currency = financial_data.get("currency", "JPY")
         if "error" in stock_data:
             table_rows.append([c["name"], c["ticker"], "取得失敗", "-", "-", "-", "-", "-"])
         else:
             sign = "+" if stock_data["change"] >= 0 else ""
+            change_str = format_price(stock_data["change"], currency)
             table_rows.append([
                 c["name"],
                 c["ticker"],
-                f"{stock_data['price']:,}円",
-                f"{sign}{stock_data['change']} ({sign}{stock_data['change_pct']}%)",
+                format_price(stock_data["price"], currency),
+                f"{sign}{change_str} ({sign}{stock_data['change_pct']}%)",
                 f"{stock_data['volume']:,}",
                 format_ratio(financial_data.get("per")),
                 format_ratio(financial_data.get("pbr")),
-                format_oku(financial_data.get("market_cap")),
+                format_large_amount(financial_data.get("market_cap"), currency),
             ])
     print(tabulate(
         table_rows,
@@ -545,11 +646,49 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
         if not earnings_trend:
             print("  (決算データが取得できませんでした)")
             continue
+        currency = c["financial_data"].get("currency", "JPY")
         earnings_rows = [
-            [e["period"], format_oku(e["revenue"]), format_oku(e["net_income"])]
+            [e["period"], format_large_amount(e["revenue"], currency), format_large_amount(e["net_income"], currency)]
             for e in earnings_trend
         ]
         print(tabulate(earnings_rows, headers=["決算期", "売上高", "純利益"], tablefmt="simple"))
+
+    print("\n=== 配当分析 ===")
+    for c in companies:
+        print(f"\n【{c['name']}】")
+        dividend_data = c["dividend_data"]
+        if "error" in dividend_data:
+            print("  (配当データを取得できませんでした)")
+            continue
+
+        yield_value = dividend_data.get("dividend_yield")
+        payout_value = dividend_data.get("payout_ratio")
+        currency = dividend_data.get("currency", "JPY")
+        # 注意: yfinanceのdividendYieldは既に「%表記の数値」(例: 3.26 = 3.26%)で返ってくるため、
+        # 100倍しない。payoutRatioは従来通り「割合」(例: 0.322 = 32.2%)で返るため100倍する。
+        yield_text = f"{yield_value:.2f}%" if yield_value else "-"
+        payout_text = f"{payout_value * 100:.1f}%" if payout_value else "-"
+        print(f"  配当利回り: {yield_text} / 配当性向: {payout_text}")
+
+        yearly_dividends = dividend_data.get("yearly_dividends", [])
+        if not yearly_dividends:
+            print("  (配当の支払い履歴がありません)")
+            continue
+
+        dividend_rows = []
+        prev_amount = None
+        for item in yearly_dividends:
+            if prev_amount is None:
+                trend = "-"
+            elif item["amount"] > prev_amount:
+                trend = "増配"
+            elif item["amount"] < prev_amount:
+                trend = "減配"
+            else:
+                trend = "据え置き"
+            dividend_rows.append([item["year"], format_per_share(item["amount"], currency), trend])
+            prev_amount = item["amount"]
+        print(tabulate(dividend_rows, headers=["年", "年間配当(1株)", "前年比"], tablefmt="simple"))
 
     print("\n=== 関連ニュース ===")
     for c in companies:
@@ -580,6 +719,38 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
         breakdown_text = " / ".join(f"{k}{v}点" for k, v in c["score"]["breakdown"].items())
         print(f"【{c['name']}】{breakdown_text}")
 
+    print("\n=== 業界内比較（このwatchlist内の同業種銘柄同士） ===")
+    print("※ 市場全体の業界平均ではなく、watchlistに登録している同業種の銘柄同士を比較した平均値です。")
+    print("  (無料データの制約上、市場全体の業界平均は取得していません)")
+    sector_stats = compute_sector_peers(companies)
+    for c in ranked:
+        sector = c["financial_data"].get("sector")
+        print(f"\n【{c['name']}】業種: {sector or '不明'}")
+        if not sector or sector_stats.get(sector, {}).get("count", 0) < 2:
+            print("  (同業種の比較対象がwatchlist内にありません)")
+            continue
+
+        stats = sector_stats[sector]
+        compare_rows = [
+            ["PER", format_ratio(c["financial_data"].get("per")), format_ratio(stats["per"])],
+            ["PBR", format_ratio(c["financial_data"].get("pbr")), format_ratio(stats["pbr"])],
+            [
+                "ROE",
+                f"{c['scoring_metrics'].get('roe') * 100:.1f}%" if c["scoring_metrics"].get("roe") is not None else "-",
+                f"{stats['roe'] * 100:.1f}%" if stats["roe"] is not None else "-",
+            ],
+            [
+                "営業利益率",
+                f"{c['scoring_metrics'].get('operating_margin') * 100:.1f}%" if c["scoring_metrics"].get("operating_margin") is not None else "-",
+                f"{stats['operating_margin'] * 100:.1f}%" if stats["operating_margin"] is not None else "-",
+            ],
+        ]
+        print(tabulate(
+            compare_rows,
+            headers=["指標", "自社", f"同業種平均(n={stats['count']})"],
+            tablefmt="simple",
+        ))
+
     print("\n=== スコア検証（簡易・過去の株価騰落率との比較） ===")
     print("※ スコアは「現在の財務状況」の点数です。過去の値動きと比べることで、")
     print("  スコアが高い銘柄が実際に値上がりしてきたかの参考になります(銘柄数が少ないと参考程度です)。")
@@ -602,6 +773,7 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
         bh_rows = []
         for c in ranked:
             result = backtest_buy_and_hold(c["ticker"], years)
+            currency = c["financial_data"].get("currency", "JPY")
             if "error" in result:
                 bh_rows.append([c["name"], "-", "-", "-"])
             else:
@@ -614,7 +786,7 @@ def print_report(watchlist: list, use_ai: bool = True) -> None:
                     c["name"],
                     f"{result['total_return_pct']:+.1f}%",
                     annualized,
-                    f"{result['total_dividends']:.1f}円/株",
+                    format_per_share(result["total_dividends"], currency),
                 ])
         print(tabulate(
             bh_rows,
