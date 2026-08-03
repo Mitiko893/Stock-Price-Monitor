@@ -4,7 +4,7 @@ on:
   schedule:
     # 毎時00分に自動更新(UTC)
     #日本時間では毎時+9時間
-    - cron: '0 0~14 * * 1-5'
+    - cron: '0 0-14 * * 1-5'
   workflow_dispatch:
     # GitHubの画面から手動実行もできるようにする
 
